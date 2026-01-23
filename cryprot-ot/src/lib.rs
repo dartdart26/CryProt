@@ -1,7 +1,8 @@
 #![warn(clippy::unwrap_used)]
 //! CryProt-OT implements several [oblivious transfer](https://en.wikipedia.org/wiki/Oblivious_transfer) protocols.
 //!
-//! - base OT: "Simplest OT" [[CO15](https://eprint.iacr.org/2015/267)]
+//! - base OT: "Simplest OT" [[CO15](https://eprint.iacr.org/2015/267)] (classical security)
+//! - post-quantum base OT: ML-KEM-768 based OT [[MR19](https://eprint.iacr.org/2019/706)] (post-quantum security)
 //! - semi-honest OT extension: optimized [[IKNP03](https://www.iacr.org/archive/crypto2003/27290145/27290145.pdf)]
 //!   protocol
 //! - malicious OT extension: optimized [[KOS15](https://eprint.iacr.org/2015/546.pdf)]
@@ -12,6 +13,20 @@
 //!   consistency check)
 //!
 //! This library is heavily inspired by and in parts a port of the C++ [libOTe](https://github.com/osu-crypto/libOTe) library.
+//!
+//! ## Post-Quantum Security
+//!
+//! Enable the `post-quantum` feature to use ML-KEM-768 based OT for the base OT
+//! protocol, providing post-quantum security:
+//!
+//! ```toml
+//! [dependencies]
+//! cryprot-ot = { version = "0.2", features = ["post-quantum"] }
+//! ```
+//!
+//! This replaces the classical "Simplest OT" (based on elliptic curves) with
+//! an ML-KEM-768 based construction following [[MR19](https://eprint.iacr.org/2019/706)],
+//! similar to libOTe's `ENABLE_MR_KYBER` option.
 //!
 //! ## Benchmarks
 //! We continously run the benchmark suite in CI witht the results publicly
@@ -57,9 +72,34 @@ use subtle::Choice;
 pub mod adapter;
 pub mod base;
 pub mod extension;
+pub mod mlkem_ot;
 pub mod noisy_vole;
 pub mod phase;
 pub mod silent_ot;
+
+/// Base OT implementation used by extension protocols.
+///
+/// When the `post-quantum` feature is enabled, this uses [`mlkem_ot::MlKemOt`]
+/// which provides post-quantum security based on ML-KEM-768.
+/// Otherwise, it uses [`base::SimplestOt`] which provides classical security.
+#[cfg(feature = "post-quantum")]
+pub type BaseOt = mlkem_ot::MlKemOt;
+
+/// Base OT implementation used by extension protocols.
+///
+/// When the `post-quantum` feature is enabled, this uses [`mlkem_ot::MlKemOt`]
+/// which provides post-quantum security based on ML-KEM-768.
+/// Otherwise, it uses [`base::SimplestOt`] which provides classical security.
+#[cfg(not(feature = "post-quantum"))]
+pub type BaseOt = base::SimplestOt;
+
+/// Error type for base OT operations.
+#[cfg(feature = "post-quantum")]
+pub type BaseOtError = mlkem_ot::Error;
+
+/// Error type for base OT operations.
+#[cfg(not(feature = "post-quantum"))]
+pub type BaseOtError = base::Error;
 
 /// Trait for OT receivers/senders which hold a [`Connection`].
 pub trait Connected {
