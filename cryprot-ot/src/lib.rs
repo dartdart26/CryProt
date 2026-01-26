@@ -70,7 +70,7 @@ use rand::{CryptoRng, Rng, SeedableRng, distr, prelude::Distribution, rngs::StdR
 use subtle::Choice;
 
 pub mod adapter;
-pub mod base;
+pub mod simplest_ot;
 pub mod extension;
 pub mod mlkem_ot;
 pub mod noisy_vole;
@@ -81,7 +81,7 @@ pub mod silent_ot;
 ///
 /// When the `post-quantum` feature is enabled, this uses [`mlkem_ot::MlKemOt`]
 /// which provides post-quantum security based on ML-KEM-768.
-/// Otherwise, it uses [`base::SimplestOt`] which provides classical security.
+/// Otherwise, it uses [`simplest_ot::SimplestOt`] which provides classical security.
 #[cfg(feature = "post-quantum")]
 pub type BaseOt = mlkem_ot::MlKemOt;
 
@@ -89,9 +89,9 @@ pub type BaseOt = mlkem_ot::MlKemOt;
 ///
 /// When the `post-quantum` feature is enabled, this uses [`mlkem_ot::MlKemOt`]
 /// which provides post-quantum security based on ML-KEM-768.
-/// Otherwise, it uses [`base::SimplestOt`] which provides classical security.
+/// Otherwise, it uses [`simplest_ot::SimplestOt`] which provides classical security.
 #[cfg(not(feature = "post-quantum"))]
-pub type BaseOt = base::SimplestOt;
+pub type BaseOt = simplest_ot::SimplestOt;
 
 /// Error type for base OT operations.
 #[cfg(feature = "post-quantum")]
@@ -99,7 +99,7 @@ pub type BaseOtError = mlkem_ot::Error;
 
 /// Error type for base OT operations.
 #[cfg(not(feature = "post-quantum"))]
-pub type BaseOtError = base::Error;
+pub type BaseOtError = simplest_ot::Error;
 
 /// Trait for OT receivers/senders which hold a [`Connection`].
 pub trait Connected {

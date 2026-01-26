@@ -8,7 +8,7 @@ use cryprot_core::{Block, alloc::HugePageMemory};
 use cryprot_net::testing::{init_bench_tracing, local_conn};
 use cryprot_ot::{
     CotReceiver, CotSender, RotReceiver, RotSender,
-    base::SimplestOt,
+    simplest_ot::SimplestOt,
     extension::{
         MaliciousOtExtensionReceiver, MaliciousOtExtensionSender, SemiHonestOtExtensionReceiver,
         SemiHonestOtExtensionSender,
