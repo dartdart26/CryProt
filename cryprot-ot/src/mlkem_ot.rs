@@ -25,6 +25,16 @@ const ENCAPSULATION_KEY_LEN: usize =
 const CIPHERTEXT_LEN: usize = <MlKem as KemCore>::CiphertextSize::USIZE;
 const HASH_DOMAIN_SEPARATOR: &[u8] = b"MlKemOt";
 
+// ML-KEM polynomial arithmetic constants for the MR19 protocol.
+// The encapsulation key is encoded as ek = ByteEncode₁₂(t̂) ‖ ρ,
+// where t̂ is a vector of k polynomials in NTT domain (k=4 for ML-KEM-1024)
+// and ρ is a 32-byte seed for the public matrix A.
+const Q: u16 = 3329;
+const RHO_BYTES: usize = 32;
+const T_HAT_BYTES: usize = ENCAPSULATION_KEY_LEN - RHO_BYTES;
+const NUM_COEFFS: usize = T_HAT_BYTES * 2 / 3;
+const MR19_HASH_DOMAIN: &[u8] = b"MlKemOtMR19";
+
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("quic connection error")]
@@ -67,8 +77,8 @@ impl ConditionallySelectable for CtBytes {
     }
 }
 
-// Message from receiver to sender: two encapsulation keys per OT.
-// For choice bit c, ek{c} is a real key, ek{1-c} is random bytes.
+// Message from receiver to sender: two values (r_0, r_1) per OT.
+// MR19 protocol: sender reconstructs pk_i = r_i + H(r_{1-i}).
 #[derive(Serialize, Deserialize)]
 struct EncapsulationKeysMessage {
     eks0: Vec<EncapKeyBytes>,
@@ -133,16 +143,21 @@ impl RotSender for MlKemOt {
 
         let mut cts0 = Vec::with_capacity(count);
         let mut cts1 = Vec::with_capacity(count);
-        for (i, (ek0, ek1)) in receiver_msg
+        for (i, (r0, r1)) in receiver_msg
             .eks0
             .iter()
             .zip(receiver_msg.eks1.iter())
             .enumerate()
         {
-            let (ct0, key0) = encapsulate(ek0, &mut self.rng);
+            // MR19: reconstruct encapsulation keys from (r_0, r_1).
+            // pk_0 = r_0 + H(r_1),  pk_1 = r_1 + H(r_0)
+            let pk0 = EncapKeyBytes(reconstruct_ek(&r0.0, &r1.0));
+            let pk1 = EncapKeyBytes(reconstruct_ek(&r1.0, &r0.0));
+
+            let (ct0, key0) = encapsulate(&pk0, &mut self.rng);
             let key0 = hash(&key0, i);
 
-            let (ct1, key1) = encapsulate(ek1, &mut self.rng);
+            let (ct1, key1) = encapsulate(&pk1, &mut self.rng);
             let key1 = hash(&key1, i);
 
             cts0.push(ct0);
@@ -182,16 +197,34 @@ impl RotReceiver for MlKemOt {
         for choice in choices.iter() {
             // Generate real keypair.
             let (dk, ek) = MlKem::generate(&mut RngCompat(&mut self.rng));
-            let real_ek = EncapKeyBytes(
-                ek.as_bytes()
-                    .as_slice()
-                    .try_into()
-                    .expect("incorrect encapsulation key size"),
-            );
-            let fake_ek = EncapKeyBytes(self.rng.random());
+            let ek_bytes: [u8; ENCAPSULATION_KEY_LEN] = ek
+                .as_bytes()
+                .as_slice()
+                .try_into()
+                .expect("incorrect encapsulation key size");
 
-            let ek0 = EncapKeyBytes::conditional_select(&real_ek, &fake_ek, *choice);
-            let ek1 = EncapKeyBytes::conditional_select(&fake_ek, &real_ek, *choice);
+            // MR19 protocol: construct (r_b, r_{1-b}) such that
+            // r_b + H(r_{1-b}) = ek (on the t̂ polynomial vector, with shared ρ).
+            let rho = &ek_bytes[T_HAT_BYTES..];
+
+            // Generate a random fake ek sharing the same ρ (same matrix A).
+            let fake_t_hat = random_coeffs(&mut self.rng);
+            let fake_ek = assemble_ek(&fake_t_hat, rho);
+
+            // r_b = ek - H(fake_ek) on t̂ coefficients.
+            let t_hat_real = decode_t_hat(&ek_bytes[..T_HAT_BYTES]);
+            let h_fake = hash_ek_to_coeffs(&fake_ek);
+            let r_b_t_hat = sub_mod_q(&t_hat_real, &h_fake);
+            let r_b_bytes = assemble_ek(&r_b_t_hat, rho);
+
+            let r_b = EncapKeyBytes(r_b_bytes);
+            let r_1_minus_b = EncapKeyBytes(fake_ek);
+
+            // Constant-time selection based on choice bit.
+            // choice=0: ek0=r_b (r_0), ek1=r_{1-b} (r_1) → pk_0 = r_0+H(r_1) = ek
+            // choice=1: ek0=r_{1-b} (r_0), ek1=r_b (r_1) → pk_1 = r_1+H(r_0) = ek
+            let ek0 = EncapKeyBytes::conditional_select(&r_b, &r_1_minus_b, *choice);
+            let ek1 = EncapKeyBytes::conditional_select(&r_1_minus_b, &r_b, *choice);
 
             decap_keys.push(dk);
             eks0.push(ek0);
@@ -237,6 +270,118 @@ impl RotReceiver for MlKemOt {
     }
 }
 
+// === MR19 polynomial arithmetic helpers ===
+// These operate on the t̂ portion of ML-KEM encapsulation keys, which is
+// encoded using ByteEncode₁₂ (FIPS 203): each 3 bytes encode 2 coefficients
+// of 12 bits each, with all coefficients in [0, q).
+
+/// Decode ByteEncode₁₂: 3 bytes → 2 coefficients (12 bits each), reduced mod q.
+fn decode_t_hat(bytes: &[u8]) -> [u16; NUM_COEFFS] {
+    debug_assert_eq!(bytes.len(), T_HAT_BYTES);
+    let mut coeffs = [0u16; NUM_COEFFS];
+    for (i, chunk) in bytes.chunks_exact(3).enumerate() {
+        let d0 = chunk[0] as u16;
+        let d1 = chunk[1] as u16;
+        let d2 = chunk[2] as u16;
+        coeffs[2 * i] = (d0 | ((d1 & 0x0F) << 8)) % Q;
+        coeffs[2 * i + 1] = ((d1 >> 4) | (d2 << 4)) % Q;
+    }
+    coeffs
+}
+
+/// Encode coefficients as ByteEncode₁₂: 2 coefficients → 3 bytes.
+fn encode_t_hat(coeffs: &[u16; NUM_COEFFS]) -> [u8; T_HAT_BYTES] {
+    let mut bytes = [0u8; T_HAT_BYTES];
+    for (i, pair) in coeffs.chunks_exact(2).enumerate() {
+        let a = pair[0];
+        let b = pair[1];
+        bytes[3 * i] = (a & 0xFF) as u8;
+        bytes[3 * i + 1] = ((a >> 8) | ((b & 0x0F) << 4)) as u8;
+        bytes[3 * i + 2] = (b >> 4) as u8;
+    }
+    bytes
+}
+
+/// Add two coefficient vectors element-wise mod q.
+fn add_mod_q(
+    a: &[u16; NUM_COEFFS],
+    b: &[u16; NUM_COEFFS],
+) -> [u16; NUM_COEFFS] {
+    let mut result = [0u16; NUM_COEFFS];
+    for i in 0..NUM_COEFFS {
+        result[i] = (a[i] + b[i]) % Q;
+    }
+    result
+}
+
+/// Subtract two coefficient vectors element-wise mod q.
+fn sub_mod_q(
+    a: &[u16; NUM_COEFFS],
+    b: &[u16; NUM_COEFFS],
+) -> [u16; NUM_COEFFS] {
+    let mut result = [0u16; NUM_COEFFS];
+    for i in 0..NUM_COEFFS {
+        result[i] = (a[i] + Q - b[i]) % Q;
+    }
+    result
+}
+
+/// Hash an encoded encapsulation key to a t̂ coefficient vector mod q.
+/// Uses BLAKE3 XOF with rejection sampling (12 bits, accept if < q).
+fn hash_ek_to_coeffs(ek: &[u8; ENCAPSULATION_KEY_LEN]) -> [u16; NUM_COEFFS] {
+    let mut ro = RandomOracle::new();
+    ro.update(MR19_HASH_DOMAIN);
+    ro.update(ek);
+    let mut xof = ro.finalize_xof();
+    let mut coeffs = [0u16; NUM_COEFFS];
+    for c in coeffs.iter_mut() {
+        loop {
+            let mut buf = [0u8; 2];
+            xof.fill(&mut buf);
+            let val = u16::from_le_bytes(buf) & 0x0FFF;
+            if val < Q {
+                *c = val;
+                break;
+            }
+        }
+    }
+    coeffs
+}
+
+/// Generate random coefficients mod q using rejection sampling.
+fn random_coeffs(rng: &mut impl Rng) -> [u16; NUM_COEFFS] {
+    let mut coeffs = [0u16; NUM_COEFFS];
+    for c in coeffs.iter_mut() {
+        loop {
+            let val: u16 = rng.random::<u16>() & 0x0FFF;
+            if val < Q {
+                *c = val;
+                break;
+            }
+        }
+    }
+    coeffs
+}
+
+/// Assemble a full encapsulation key encoding from t̂ coefficients and ρ.
+fn assemble_ek(t_hat: &[u16; NUM_COEFFS], rho: &[u8]) -> [u8; ENCAPSULATION_KEY_LEN] {
+    let mut ek = [0u8; ENCAPSULATION_KEY_LEN];
+    ek[..T_HAT_BYTES].copy_from_slice(&encode_t_hat(t_hat));
+    ek[T_HAT_BYTES..].copy_from_slice(rho);
+    ek
+}
+
+/// MR19 key reconstruction: pk = r + H(other), using ρ from r.
+fn reconstruct_ek(
+    r: &[u8; ENCAPSULATION_KEY_LEN],
+    other: &[u8; ENCAPSULATION_KEY_LEN],
+) -> [u8; ENCAPSULATION_KEY_LEN] {
+    let r_coeffs = decode_t_hat(&r[..T_HAT_BYTES]);
+    let h_other = hash_ek_to_coeffs(other);
+    let pk_coeffs = add_mod_q(&r_coeffs, &h_other);
+    assemble_ek(&pk_coeffs, &r[T_HAT_BYTES..])
+}
+
 // Encapsulates to the given key, returning the ciphertext and the shared key.
 fn encapsulate(ek: &EncapKeyBytes, rng: &mut StdRng) -> (CtBytes, SharedKey<MlKem>) {
     let parsed_ek = MlKemEncapsulationKey::<MlKemParams>::from_bytes((&ek.0).into());
@@ -270,6 +415,56 @@ mod tests {
 
     use super::MlKemOt;
     use crate::{RotReceiver, RotSender, random_choices};
+
+    #[test]
+    fn encode_decode_roundtrip() {
+        use super::*;
+        let mut rng = StdRng::seed_from_u64(42);
+        let (_, ek) = MlKem::generate(&mut RngCompat(&mut rng));
+        let ek_bytes: [u8; ENCAPSULATION_KEY_LEN] =
+            ek.as_bytes().as_slice().try_into().unwrap();
+
+        // Check all coefficients are < Q
+        let coeffs = decode_t_hat(&ek_bytes[..T_HAT_BYTES]);
+        for (i, &c) in coeffs.iter().enumerate() {
+            assert!(c < Q, "coefficient {i} = {c} >= Q={Q}");
+        }
+
+        // Check encode roundtrip
+        let re_encoded = encode_t_hat(&coeffs);
+        assert_eq!(
+            &ek_bytes[..T_HAT_BYTES],
+            &re_encoded[..],
+            "encode/decode roundtrip failed"
+        );
+    }
+
+    #[test]
+    fn mr19_reconstruction() {
+        use super::*;
+        let mut rng = StdRng::seed_from_u64(42);
+        let (_, ek) = MlKem::generate(&mut RngCompat(&mut rng));
+        let ek_bytes: [u8; ENCAPSULATION_KEY_LEN] =
+            ek.as_bytes().as_slice().try_into().unwrap();
+        let rho = &ek_bytes[T_HAT_BYTES..];
+
+        // Generate fake key
+        let fake_t_hat = random_coeffs(&mut rng);
+        let fake_ek = assemble_ek(&fake_t_hat, rho);
+
+        // Compute r_b = ek - H(fake_ek)
+        let t_hat_real = decode_t_hat(&ek_bytes[..T_HAT_BYTES]);
+        let h_fake = hash_ek_to_coeffs(&fake_ek);
+        let r_b_t_hat = sub_mod_q(&t_hat_real, &h_fake);
+        let r_b_bytes = assemble_ek(&r_b_t_hat, rho);
+
+        // Reconstruct: pk = r_b + H(fake_ek)
+        let reconstructed = reconstruct_ek(&r_b_bytes, &fake_ek);
+        assert_eq!(
+            ek_bytes, reconstructed,
+            "MR19 reconstruction failed: pk != ek"
+        );
+    }
 
     #[tokio::test]
     async fn mlkem_base_rot_random_choices() -> Result<()> {
