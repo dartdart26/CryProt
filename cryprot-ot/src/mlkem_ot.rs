@@ -47,8 +47,10 @@ const HASH_DOMAIN_SEPARATOR: &[u8] = b"MlKemOt";
 // Number of coefficients per polynomial (FIPS 203, Section 2: n = 256).
 const NUM_COEFFICIENTS: usize = 256;
 
-/// rho is a 32-byte seed used to derive the public matrix A_hat (FIPS 203).
-type Rho = [u8; 32];
+type Seed = [u8; 32];
+
+/// rho is the seed used to derive the public matrix A_hat (FIPS 203).
+type Rho = Seed;
 
 // Serialized t_hat is the encapsulation key minus the rho suffix.
 const T_HAT_BYTES_LEN: usize = ENCAPSULATION_KEY_LEN - size_of::<Rho>();
@@ -98,13 +100,14 @@ fn xof(seed: &Rho, j: u8, i: u8) -> impl XofReader {
 fn sample_ntt_poly(xof: &mut impl XofReader) -> NttPolynomial<MlKemField> {
     const Q: u16 = MlKemField::Q;
     // Read 32 triples (3 bytes each) at a time from the XOF.
-    const BUF_LEN: usize = 96;
+    const BUF_LEN: usize = 32 * 3;
     let mut poly = NttPolynomial::<MlKemField>::default();
     let mut buf = [0u8; BUF_LEN];
     let mut pos = BUF_LEN; // start at end to trigger first read
     let mut i = 0;
 
     while i < NUM_COEFFICIENTS {
+        // Read BUF_LEN chunks from the XOF, consume and then refill once exhausted.
         if pos >= BUF_LEN {
             xof.read(&mut buf);
             pos = 0;
@@ -128,9 +131,9 @@ fn sample_ntt_poly(xof: &mut impl XofReader) -> NttPolynomial<MlKemField> {
 }
 
 /// SampleNTTVector: call SampleNTT k times with FIPS 203 domain separation.
-/// Produces a pseudorandom NttVector<k> from a 32-byte seed.
+/// Produces a pseudorandom NttVector<k> from a seed.
 /// Each polynomial j uses XOF(seed || j || 0).
-fn sample_ntt_vector(seed: &Rho) -> NttVector {
+fn sample_ntt_vector(seed: &Seed) -> NttVector {
     NttVector::new(
         (0..K::USIZE)
             .map(|j| {
