@@ -29,8 +29,11 @@ cryprot-net.workspace = true
 cryprot-pprf.workspace = true
 curve25519-dalek = { workspace = true, features = ["rand_core", "serde"] }
 futures.workspace = true
+hybrid-array.workspace = true
 ml-kem.workspace = true
+module-lattice.workspace = true
 rand.workspace = true
+sha3.workspace = true
 serde_bytes.workspace = true
 serde = { workspace = true, features = ["derive"] }
 subtle.workspace = true

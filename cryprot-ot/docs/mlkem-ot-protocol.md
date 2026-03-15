@@ -178,7 +178,8 @@ ek_b = r_b + H(r_{1-b})
      = (ek - H(r_{1-b})) + H(r_{1-b})
      = ek
 ```
-So `ek_b = ek`, the real public key. In step 10, the receiver calls `ML-KEM.Decaps(dk, ct_b)` and recovers the same shared secret `ss_b` that the sender computed via `ML-KEM.Encaps(ek_b)` in step 7.
+So `ek_b = ek`, the real public key. In step 10, the receiver calls `ML-KEM.Decaps(dk, ct_b)` and
+recovers the same shared secret `ss_b` that the sender computed via `ML-KEM.Encaps(ek_b)` in step 7.
 
 **Security:**
 

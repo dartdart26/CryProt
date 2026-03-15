@@ -500,10 +500,13 @@ dependencies = [
  "cryprot-pprf",
  "curve25519-dalek",
  "futures",
+ "hybrid-array 0.4.7",
  "ml-kem",
+ "module-lattice",
  "rand 0.10.0",
  "serde",
  "serde_bytes",
+ "sha3",
  "subtle",
  "thiserror",
  "tokio",
@@ -1203,6 +1206,16 @@ dependencies = [
  "kem",
  "rand_core 0.6.4",
  "sha3",
+]
+
+[[package]]
+name = "module-lattice"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6dfecc750073acc09af2f8899b2342d520d570392ba1c3aed53eeb0d84ca4103"
+dependencies = [
+ "hybrid-array 0.4.7",
+ "num-traits",
 ]
 
 [[package]]
