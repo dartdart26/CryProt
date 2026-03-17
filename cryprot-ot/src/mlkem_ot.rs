@@ -220,6 +220,12 @@ pub enum Error {
 #[derive(Copy, Clone, Serialize, Deserialize)]
 struct EncapsulationKeyBytes(#[serde(with = "serde_bytes")] [u8; ENCAPSULATION_KEY_LEN]);
 
+impl From<&EncapsulationKey> for EncapsulationKeyBytes {
+    fn from(ek: &EncapsulationKey) -> Self {
+        Self(ek.to_bytes())
+    }
+}
+
 impl ConditionallySelectable for EncapsulationKeyBytes {
     fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
         Self(<[u8; ENCAPSULATION_KEY_LEN]>::conditional_select(
@@ -310,18 +316,21 @@ impl RotSender for MlKemOt {
             .zip(receiver_msg.eks1.iter())
             .enumerate()
         {
-            // Reconstruct encapsulation keys: ek_j = r_j + H(r_{1-j})
+            // Step 5: Receive (r_0, r_1) from the receiver (done above).
             let r0 = EncapsulationKey::from_bytes(&r0_bytes.0);
             let r1 = EncapsulationKey::from_bytes(&r1_bytes.0);
 
+            // Step 6: Reconstruct encapsulation keys: ek_j = r_j + H(r_{1-j}).
             let ek0 = &r0 + &hash_to_key(&r1);
             let ek1 = &r1 + &hash_to_key(&r0);
 
-            let (ct0, key0) = encapsulate(&EncapsulationKeyBytes(ek0.to_bytes()), &mut self.rng);
-            let key0 = hash(&key0, i);
+            // Step 7: Encapsulate to both reconstructed keys.
+            let (ct0, ss0) = encapsulate(&(&ek0).into(), &mut self.rng);
+            let (ct1, ss1) = encapsulate(&(&ek1).into(), &mut self.rng);
 
-            let (ct1, key1) = encapsulate(&EncapsulationKeyBytes(ek1.to_bytes()), &mut self.rng);
-            let key1 = hash(&key1, i);
+            // Step 8: Derive OT output keys.
+            let key0 = hash(&ss0, i);
+            let key1 = hash(&ss1, i);
 
             cts0.push(ct0);
             cts1.push(ct1);
@@ -372,10 +381,8 @@ impl RotReceiver for MlKemOt {
 
             // Step 3: Compute correlated key: r_b = ek - H(r_{1-b}).
             let r_b = &ek - &hash_to_key(&r_1_b);
-
-            // Serialize both keys.
-            let r_b_bytes = EncapsulationKeyBytes(r_b.to_bytes());
-            let r_1_b_bytes = EncapsulationKeyBytes(r_1_b.to_bytes());
+            let r_b_bytes: EncapsulationKeyBytes = (&r_b).into();
+            let r_1_b_bytes: EncapsulationKeyBytes = (&r_1_b).into();
 
             // Step 4: Select (r_0, r_1) based on choice bit (constant-time).
             // If b=0: r_0 = real, r_1 = random.
