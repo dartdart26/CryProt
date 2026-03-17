@@ -18,7 +18,7 @@
 //!
 //! ## ML-KEM Base OT
 //!
-//! Enable the `ml-kem-base-ot` feature to use ML-KEM-based OT for the base OT
+//! Enable one of the `ml-kem-base-ot-{512,768,1024}` features to use ML-KEM-based OT for the base OT
 //! protocol, providing post-quantum security:
 //!
 //! This replaces the classical "Simplest OT" with an ML-KEM-based construction
@@ -68,6 +68,7 @@ use subtle::Choice;
 
 pub mod adapter;
 pub mod extension;
+#[cfg(feature = "_ml-kem-base-ot")]
 pub mod mlkem_ot;
 pub mod noisy_vole;
 pub mod phase;
@@ -77,22 +78,22 @@ pub mod simplest_ot;
 /// Base OT implementation used by extension protocols.
 ///
 /// When the `ml-kem-base-ot` feature is enabled, use [`mlkem_ot::MlKemOt`]
-#[cfg(feature = "ml-kem-base-ot")]
+#[cfg(feature = "_ml-kem-base-ot")]
 pub type BaseOt = mlkem_ot::MlKemOt;
 
 /// Base OT implementation used by extension protocols.
 ///
 /// When the `ml-kem-base-ot` feature is not enabled, use
 /// [`simplest_ot::SimplestOt`].
-#[cfg(not(feature = "ml-kem-base-ot"))]
+#[cfg(not(feature = "_ml-kem-base-ot"))]
 pub type BaseOt = simplest_ot::SimplestOt;
 
 /// Error type for base OT operations.
-#[cfg(feature = "ml-kem-base-ot")]
+#[cfg(feature = "_ml-kem-base-ot")]
 pub type BaseOtError = mlkem_ot::Error;
 
 /// Error type for base OT operations.
-#[cfg(not(feature = "ml-kem-base-ot"))]
+#[cfg(not(feature = "_ml-kem-base-ot"))]
 pub type BaseOtError = simplest_ot::Error;
 
 /// Trait for OT receivers/senders which hold a [`Connection`].

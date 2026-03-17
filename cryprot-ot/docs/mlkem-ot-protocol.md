@@ -69,9 +69,9 @@ In libOTe, this corresponds to `randomPK`, where it instead generates `A_hat` an
 
 Output: `(t_hat, rho)`. The `rho` is passed through unchanged.
 
-**`H(ek) -> (h, ek.rho)`**
+**`HashToKey(ek) -> (h, ek.rho)`**
 
-Hash-to-key (corresponds to libOTe's `pkHash`). Maps an encapsulation key to another
+HashToKey corresponds to libOTe's `pkHash`. Maps an encapsulation key to another
 encapsulation key. Takes an element of `T_q^k`, hashes it to a 32-byte seed, and uses that seed to sample a new element of `T_q^k`.
 
 Given an encapsulation key `ek = (t_hat, rho)`:

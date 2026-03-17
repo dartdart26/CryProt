@@ -10,8 +10,12 @@ authors.workspace = true
 repository.workspace = true
 
 [features]
-# Use ML-KEM-based OT for base OT.
-ml-kem-base-ot = []
+# ML-KEM-based base OT. Pickm only one variant.
+ml-kem-base-ot-512 = ["_ml-kem-base-ot"]
+ml-kem-base-ot-768 = ["_ml-kem-base-ot"]
+ml-kem-base-ot-1024 = ["_ml-kem-base-ot"]
+# Internal feature — do not enable directly.
+_ml-kem-base-ot = []
 
 [lints]
 workspace = true

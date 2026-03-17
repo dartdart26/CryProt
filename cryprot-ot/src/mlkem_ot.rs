@@ -10,18 +10,22 @@ use cryprot_core::{Block, buf::Buf, rand_compat::RngCompat, random_oracle::Rando
 use cryprot_net::{Connection, ConnectionError};
 use futures::{SinkExt, StreamExt};
 use hybrid_array::typenum::Unsigned;
-// ML-KEM variant: change to MlKem512/MlKem512Params or MlKem768/MlKem768Params
-// for different security levels.
 use ml_kem::{
-    Ciphertext as MlKemCiphertext, EncodedSizeUser, KemCore, MlKem1024 as MlKem,
-    MlKem1024Params as MlKemParams, ParameterSet, SharedKey,
+    Ciphertext as MlKemCiphertext, EncodedSizeUser, KemCore, ParameterSet, SharedKey,
     kem::{Decapsulate, DecapsulationKey, Encapsulate, EncapsulationKey as MlKemEncapsulationKey},
 };
+// ML-KEM parameter set selection.
+#[cfg(feature = "ml-kem-base-ot-512")]
+use ml_kem::{MlKem512 as MlKem, MlKem512Params as MlKemParams};
+#[cfg(feature = "ml-kem-base-ot-768")]
+use ml_kem::{MlKem768 as MlKem, MlKem768Params as MlKemParams};
+#[cfg(feature = "ml-kem-base-ot-1024")]
+use ml_kem::{MlKem1024 as MlKem, MlKem1024Params as MlKemParams};
 use module_lattice::{Encode, Field, NttPolynomial};
 use rand::{RngExt, rngs::StdRng};
 use serde::{Deserialize, Serialize};
 use sha3::{
-    Shake128,
+    Digest, Shake128,
     digest::{ExtendableOutput, Update, XofReader},
 };
 use subtle::{Choice, ConditionallySelectable};
@@ -49,43 +53,69 @@ const NUM_COEFFICIENTS: usize = 256;
 
 type Seed = [u8; 32];
 
-/// rho is the seed used to derive the public matrix A_hat (FIPS 203).
-type Rho = Seed;
-
 // Serialized t_hat is the encapsulation key minus the rho suffix.
-const T_HAT_BYTES_LEN: usize = ENCAPSULATION_KEY_LEN - size_of::<Rho>();
+const T_HAT_BYTES_LEN: usize = ENCAPSULATION_KEY_LEN - size_of::<Seed>();
 
 // ---------------------------------------------------------------------------
 // Protocol helper functions (see docs/mlkem-ot-protocol.md)
 // ---------------------------------------------------------------------------
 
-/// Parse serialized encapsulation key bytes into (NttVector, rho).
-/// The input is a fixed-size array so the slicing is infallible.
-fn parse_ek(bytes: &[u8; ENCAPSULATION_KEY_LEN]) -> (NttVector, Rho) {
-    let enc = bytes[..T_HAT_BYTES_LEN]
-        .try_into()
-        .expect("t_hat length mismatch");
-    let t_hat = <NttVector as Encode<U12>>::decode(enc);
-    let rho = bytes[T_HAT_BYTES_LEN..]
-        .try_into()
-        .expect("rho length mismatch");
-    (t_hat, rho)
+/// Parsed encapsulation key: ek = (t_hat, rho).
+struct EncapsulationKey {
+    t_hat: NttVector,
+    rho: Seed,
 }
 
-/// Serialize NttVector + rho back into encapsulation key bytes.
-fn serialize_ek(t_hat: &NttVector, rho: &Rho) -> [u8; ENCAPSULATION_KEY_LEN] {
-    let encoded = <NttVector as Encode<U12>>::encode(t_hat);
-    let mut out = [0u8; ENCAPSULATION_KEY_LEN];
-    out[..T_HAT_BYTES_LEN].copy_from_slice(encoded.as_slice());
-    out[T_HAT_BYTES_LEN..].copy_from_slice(rho);
-    out
+impl EncapsulationKey {
+    /// Parse from serialized bytes.
+    fn from_bytes(bytes: &[u8; ENCAPSULATION_KEY_LEN]) -> Self {
+        let enc = bytes[..T_HAT_BYTES_LEN]
+            .try_into()
+            .expect("t_hat length mismatch");
+        let t_hat = <NttVector as Encode<U12>>::decode(enc);
+        let rho = bytes[T_HAT_BYTES_LEN..]
+            .try_into()
+            .expect("rho length mismatch");
+        Self { t_hat, rho }
+    }
+
+    /// Serialize to bytes.
+    fn to_bytes(&self) -> [u8; ENCAPSULATION_KEY_LEN] {
+        let encoded = <NttVector as Encode<U12>>::encode(&self.t_hat);
+        let mut out = [0u8; ENCAPSULATION_KEY_LEN];
+        out[..T_HAT_BYTES_LEN].copy_from_slice(encoded.as_slice());
+        out[T_HAT_BYTES_LEN..].copy_from_slice(&self.rho);
+        out
+    }
+}
+
+impl std::ops::Sub<&NttVector> for &EncapsulationKey {
+    type Output = EncapsulationKey;
+
+    fn sub(self, rhs: &NttVector) -> EncapsulationKey {
+        EncapsulationKey {
+            t_hat: &self.t_hat - rhs,
+            rho: self.rho,
+        }
+    }
+}
+
+impl std::ops::Add<&NttVector> for &EncapsulationKey {
+    type Output = EncapsulationKey;
+
+    fn add(self, rhs: &NttVector) -> EncapsulationKey {
+        EncapsulationKey {
+            t_hat: &self.t_hat + rhs,
+            rho: self.rho,
+        }
+    }
 }
 
 /// XOF(rho, j, i) from FIPS 203, Algorithm 2 SHAKE128example.
 /// In Algorithm 13 (K-PKE.KeyGen), this is called as XOF(rho, j, i) where
 /// j is the column index (byte 32) and i is the row index (byte 33),
 /// using 0-based indexing.
-fn xof(seed: &Rho, j: u8, i: u8) -> impl XofReader {
+fn xof(seed: &Seed, j: u8, i: u8) -> impl XofReader {
     let mut h = Shake128::default();
     h.update(seed);
     h.update(&[i, j]);
@@ -103,11 +133,12 @@ fn sample_ntt_poly(xof: &mut impl XofReader) -> NttPolynomial<MlKemField> {
     const BUF_LEN: usize = 32 * 3;
     let mut poly = NttPolynomial::<MlKemField>::default();
     let mut buf = [0u8; BUF_LEN];
-    let mut pos = BUF_LEN; // start at end to trigger first read
+    xof.read(&mut buf);
+    let mut pos = 0;
     let mut i = 0;
 
     while i < NUM_COEFFICIENTS {
-        // Read BUF_LEN chunks from the XOF, consume and then refill once exhausted.
+        // Refill the buffer from the XOF stream when exhausted.
         if pos >= BUF_LEN {
             xof.read(&mut buf);
             pos = 0;
@@ -144,19 +175,22 @@ fn sample_ntt_vector(seed: &Seed) -> NttVector {
     )
 }
 
-/// H(ek): hash-to-key. Maps an NttVector to another NttVector via SHA3-256.
+/// Maps an encapsulation key to an NttVector via SHA3-256.
+/// Only the t_hat component is hashed; rho is ignored.
 /// Corresponds to libOTe's `pkHash`.
-fn hash_to_key(t_hat: &NttVector) -> NttVector {
-    use sha3::Digest;
-    let encoded = <NttVector as Encode<U12>>::encode(t_hat);
-    let seed: Rho = sha3::Sha3_256::digest(encoded.as_slice()).into();
+fn hash_to_key(ek: &EncapsulationKey) -> NttVector {
+    let encoded = <NttVector as Encode<U12>>::encode(&ek.t_hat);
+    let seed: Seed = sha3::Sha3_256::digest(encoded.as_slice()).into();
     sample_ntt_vector(&seed)
 }
 
-/// RandomEK: generate a random NttVector from a random seed.
-fn random_ek(rng: &mut StdRng) -> NttVector {
-    let seed: Rho = rng.random();
-    sample_ntt_vector(&seed)
+/// RandomEK: generate a random encapsulation key from a random seed.
+fn random_ek(rng: &mut StdRng, rho: Seed) -> EncapsulationKey {
+    let seed: Seed = rng.random();
+    EncapsulationKey {
+        t_hat: sample_ntt_vector(&seed),
+        rho,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -184,9 +218,9 @@ pub enum Error {
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize)]
-struct EncapKeyBytes(#[serde(with = "serde_bytes")] [u8; ENCAPSULATION_KEY_LEN]);
+struct EncapsulationKeyBytes(#[serde(with = "serde_bytes")] [u8; ENCAPSULATION_KEY_LEN]);
 
-impl ConditionallySelectable for EncapKeyBytes {
+impl ConditionallySelectable for EncapsulationKeyBytes {
     fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
         Self(<[u8; ENCAPSULATION_KEY_LEN]>::conditional_select(
             &a.0, &b.0, choice,
@@ -208,8 +242,8 @@ impl ConditionallySelectable for CtBytes {
 // Message from receiver to sender: two values (r_0, r_1) per OT.
 #[derive(Serialize, Deserialize)]
 struct EncapsulationKeysMessage {
-    eks0: Vec<EncapKeyBytes>,
-    eks1: Vec<EncapKeyBytes>,
+    eks0: Vec<EncapsulationKeyBytes>,
+    eks1: Vec<EncapsulationKeyBytes>,
 }
 
 // Message from sender to receiver: two ciphertexts per OT.
@@ -277,16 +311,16 @@ impl RotSender for MlKemOt {
             .enumerate()
         {
             // Reconstruct encapsulation keys: ek_j = r_j + H(r_{1-j})
-            let (r0, rho) = parse_ek(&r0_bytes.0);
-            let (r1, _) = parse_ek(&r1_bytes.0);
+            let r0 = EncapsulationKey::from_bytes(&r0_bytes.0);
+            let r1 = EncapsulationKey::from_bytes(&r1_bytes.0);
 
-            let ek0_bytes = serialize_ek(&(&r0 + &hash_to_key(&r1)), &rho);
-            let ek1_bytes = serialize_ek(&(&r1 + &hash_to_key(&r0)), &rho);
+            let ek0 = &r0 + &hash_to_key(&r1);
+            let ek1 = &r1 + &hash_to_key(&r0);
 
-            let (ct0, key0) = encapsulate(&EncapKeyBytes(ek0_bytes), &mut self.rng);
+            let (ct0, key0) = encapsulate(&EncapsulationKeyBytes(ek0.to_bytes()), &mut self.rng);
             let key0 = hash(&key0, i);
 
-            let (ct1, key1) = encapsulate(&EncapKeyBytes(ek1_bytes), &mut self.rng);
+            let (ct1, key1) = encapsulate(&EncapsulationKeyBytes(ek1.to_bytes()), &mut self.rng);
             let key1 = hash(&key1, i);
 
             cts0.push(ct0);
@@ -331,23 +365,23 @@ impl RotReceiver for MlKemOt {
                 .as_slice()
                 .try_into()
                 .expect("incorrect encapsulation key size");
-            let (real_t_hat, rho) = parse_ek(&ek_bytes);
+            let ek = EncapsulationKey::from_bytes(&ek_bytes);
 
             // Step 2: Sample random key for position 1-b.
-            let rand_t_hat = random_ek(&mut self.rng);
+            let r_1_b = random_ek(&mut self.rng, ek.rho);
 
-            // Step 3: Compute correlated key for position b: r_b = ek - H(r_{1-b}).
-            let correlated_t_hat = &real_t_hat - &hash_to_key(&rand_t_hat);
+            // Step 3: Compute correlated key: r_b = ek - H(r_{1-b}).
+            let r_b = &ek - &hash_to_key(&r_1_b);
 
-            // Serialize both keys with the same rho.
-            let correlated_bytes = EncapKeyBytes(serialize_ek(&correlated_t_hat, &rho));
-            let random_bytes = EncapKeyBytes(serialize_ek(&rand_t_hat, &rho));
+            // Serialize both keys.
+            let r_b_bytes = EncapsulationKeyBytes(r_b.to_bytes());
+            let r_1_b_bytes = EncapsulationKeyBytes(r_1_b.to_bytes());
 
             // Step 4: Select (r_0, r_1) based on choice bit (constant-time).
-            // If b=0: r_0 = correlated (real side), r_1 = random.
-            // If b=1: r_0 = random, r_1 = correlated (real side).
-            let ek0 = EncapKeyBytes::conditional_select(&correlated_bytes, &random_bytes, *choice);
-            let ek1 = EncapKeyBytes::conditional_select(&random_bytes, &correlated_bytes, *choice);
+            // If b=0: r_0 = real, r_1 = random.
+            // If b=1: r_0 = random, r_1 = real.
+            let ek0 = EncapsulationKeyBytes::conditional_select(&r_b_bytes, &r_1_b_bytes, *choice);
+            let ek1 = EncapsulationKeyBytes::conditional_select(&r_1_b_bytes, &r_b_bytes, *choice);
 
             decap_keys.push(dk);
             eks0.push(ek0);
@@ -397,7 +431,7 @@ impl RotReceiver for MlKemOt {
 }
 
 // Encapsulates to the given key, returning the ciphertext and the shared key.
-fn encapsulate(ek: &EncapKeyBytes, rng: &mut StdRng) -> (CtBytes, SharedKey<MlKem>) {
+fn encapsulate(ek: &EncapsulationKeyBytes, rng: &mut StdRng) -> (CtBytes, SharedKey<MlKem>) {
     let parsed_ek = MlKemEncapsulationKey::<MlKemParams>::from_bytes((&ek.0).into());
     let (ct, k): (MlKemCiphertext<MlKem>, SharedKey<MlKem>) = parsed_ek
         .encapsulate(&mut RngCompat(rng))
