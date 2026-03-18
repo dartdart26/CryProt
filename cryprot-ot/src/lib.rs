@@ -3,8 +3,9 @@
 //!
 //! - base OT: "Simplest OT" [[CO15](https://eprint.iacr.org/2015/267)]
 //!   (classical security)
-//! - post-quantum base OT: ML-KEM-768 based OT [[MR19](https://eprint.iacr.org/2019/706)]
-//!   (post-quantum security)
+//! - post-quantum base OT: ML-KEM based OT [[MR19](https://eprint.iacr.org/2019/706)]
+//!   (post-quantum security, enable one of the `ml-kem-base-ot-{512,768,1024}`
+//!   features)
 //! - semi-honest OT extension: optimized [[IKNP03](https://www.iacr.org/archive/crypto2003/27290145/27290145.pdf)]
 //!   protocol
 //! - malicious OT extension: optimized [[KOS15](https://eprint.iacr.org/2015/546.pdf)]
@@ -18,8 +19,8 @@
 //!
 //! ## ML-KEM Base OT
 //!
-//! Enable one of the `ml-kem-base-ot-{512,768,1024}` features to use ML-KEM-based OT for the base OT
-//! protocol, providing post-quantum security:
+//! Enable one of the `ml-kem-base-ot-{512,768,1024}` features to use
+//! ML-KEM-based OT for the base OT protocol, providing post-quantum security:
 //!
 //! This replaces the classical "Simplest OT" with an ML-KEM-based construction
 //! following FIPS 203 at <https://csrc.nist.gov/pubs/fips/203/final>, similar to libOTe's `ENABLE_MR_KYBER` option.
@@ -77,7 +78,8 @@ pub mod simplest_ot;
 
 /// Base OT implementation used by extension protocols.
 ///
-/// When the `ml-kem-base-ot` feature is enabled, use [`mlkem_ot::MlKemOt`]
+/// When one of the `ml-kem-base-ot-{512,768,1024}` features is enabled, uses
+/// [`mlkem_ot::MlKemOt`].
 #[cfg(feature = "_ml-kem-base-ot")]
 pub type BaseOt = mlkem_ot::MlKemOt;
 

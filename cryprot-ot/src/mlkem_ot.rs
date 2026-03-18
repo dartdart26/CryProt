@@ -14,13 +14,16 @@ use ml_kem::{
     Ciphertext as MlKemCiphertext, EncodedSizeUser, KemCore, ParameterSet, SharedKey,
     kem::{Decapsulate, DecapsulationKey, Encapsulate, EncapsulationKey as MlKemEncapsulationKey},
 };
-// ML-KEM parameter set selection.
-#[cfg(feature = "ml-kem-base-ot-512")]
-use ml_kem::{MlKem512 as MlKem, MlKem512Params as MlKemParams};
-#[cfg(feature = "ml-kem-base-ot-768")]
-use ml_kem::{MlKem768 as MlKem, MlKem768Params as MlKemParams};
-#[cfg(feature = "ml-kem-base-ot-1024")]
-use ml_kem::{MlKem1024 as MlKem, MlKem1024Params as MlKemParams};
+// ML-KEM parameter set selection. If multiple features are enabled, the highest wins.
+cfg_if::cfg_if! {
+    if #[cfg(feature = "ml-kem-base-ot-1024")] {
+        use ml_kem::{MlKem1024 as MlKem, MlKem1024Params as MlKemParams};
+    } else if #[cfg(feature = "ml-kem-base-ot-768")] {
+        use ml_kem::{MlKem768 as MlKem, MlKem768Params as MlKemParams};
+    } else if #[cfg(feature = "ml-kem-base-ot-512")] {
+        use ml_kem::{MlKem512 as MlKem, MlKem512Params as MlKemParams};
+    }
+}
 use module_lattice::{Encode, Field, NttPolynomial};
 use rand::{RngExt, rngs::StdRng};
 use serde::{Deserialize, Serialize};
@@ -56,18 +59,13 @@ type Seed = [u8; 32];
 // Serialized t_hat is the encapsulation key minus the rho suffix.
 const T_HAT_BYTES_LEN: usize = ENCAPSULATION_KEY_LEN - size_of::<Seed>();
 
-// ---------------------------------------------------------------------------
-// Protocol helper functions (see docs/mlkem-ot-protocol.md)
-// ---------------------------------------------------------------------------
-
-/// Parsed encapsulation key: ek = (t_hat, rho).
+// Parsed encapsulation key: ek = (t_hat, rho).
 struct EncapsulationKey {
     t_hat: NttVector,
     rho: Seed,
 }
 
 impl EncapsulationKey {
-    /// Parse from serialized bytes.
     fn from_bytes(bytes: &[u8; ENCAPSULATION_KEY_LEN]) -> Self {
         let enc = bytes[..T_HAT_BYTES_LEN]
             .try_into()
@@ -79,7 +77,6 @@ impl EncapsulationKey {
         Self { t_hat, rho }
     }
 
-    /// Serialize to bytes.
     fn to_bytes(&self) -> [u8; ENCAPSULATION_KEY_LEN] {
         let encoded = <NttVector as Encode<U12>>::encode(&self.t_hat);
         let mut out = [0u8; ENCAPSULATION_KEY_LEN];
@@ -111,25 +108,23 @@ impl std::ops::Add<&NttVector> for &EncapsulationKey {
     }
 }
 
-/// XOF(seed, j, i) from FIPS 203, Algorithm 2 SHAKE128example.
-/// In Algorithm 13 (K-PKE.KeyGen), this is called as XOF(seed, j, i) where
-/// j is the column index (byte 32) and i is the row index (byte 33),
-/// using 0-based indexing.
-fn xof(seed: &Seed, j: u8, i: u8) -> impl XofReader {
+// XOF: SHAKE-128(seed || i || j), see FIPS 203 Section 4.1.
+fn xof(seed: &Seed, i: u8, j: u8) -> impl XofReader {
     let mut h = Shake128::default();
     h.update(seed);
     h.update(&[i, j]);
     h.finalize_xof()
 }
 
-/// FIPS 203 Algorithm 7: SampleNTT.
-/// Rejection sampling from a byte stream to produce a pseudorandom NTT
-/// polynomial.
-///
-/// Adapted from the ml-kem crate's `sample_ntt`.
+// FIPS 203 Algorithm 7: SampleNTT.
+// Rejection sampling from a byte stream to produce a pseudorandom NTT
+// polynomial.
+//
+// Adapted from the ml-kem crate's `sample_ntt`.
 fn sample_ntt_poly(xof: &mut impl XofReader) -> NttPolynomial<MlKemField> {
     const Q: u16 = MlKemField::Q;
     // Read 32 triples (3 bytes each) at a time from the XOF.
+    // BUF_LEN must be divisible by 3 so pos always lands exactly on BUF_LEN.
     const BUF_LEN: usize = 32 * 3;
     let mut poly = NttPolynomial::<MlKemField>::default();
     let mut buf = [0u8; BUF_LEN];
@@ -161,30 +156,30 @@ fn sample_ntt_poly(xof: &mut impl XofReader) -> NttPolynomial<MlKemField> {
     poly
 }
 
-/// SampleNTTVector: call SampleNTT k times with FIPS 203 domain separation.
-/// Produces a pseudorandom NttVector<k> from a seed.
-/// Each polynomial j uses XOF(seed || j || 0).
+// Produces a pseudorandom NttVector from a seed.
+// Calls sample_ntt_poly k times, each with a different XOF stream: xof(seed ||
+// 0 || j).
 fn sample_ntt_vector(seed: &Seed) -> NttVector {
     NttVector::new(
         (0..K::USIZE)
             .map(|j| {
-                let mut reader = xof(seed, j as u8, 0);
+                let mut reader = xof(seed, 0, j as u8);
                 sample_ntt_poly(&mut reader)
             })
             .collect(),
     )
 }
 
-/// Maps an encapsulation key to an NttVector via SHA3-256.
-/// Only the t_hat component is used; rho is ignored.
-/// Corresponds to libOTe's `pkHash`.
+// Maps an encapsulation key to an NttVector via SHA3-256.
+// Only the t_hat component is used; rho is ignored.
+// Corresponds to libOTe's `pkHash`.
 fn hash_ek(ek: &EncapsulationKey) -> NttVector {
     let encoded = <NttVector as Encode<U12>>::encode(&ek.t_hat);
     let seed: Seed = sha3::Sha3_256::digest(encoded.as_slice()).into();
     sample_ntt_vector(&seed)
 }
 
-/// Generate a random encapsulation key using the given randomness and rho.
+// Generate a random encapsulation key using the given randomness and rho.
 fn random_ek(rng: &mut StdRng, rho: Seed) -> EncapsulationKey {
     let seed: Seed = rng.random();
     EncapsulationKey {
@@ -193,10 +188,6 @@ fn random_ek(rng: &mut StdRng, rho: Seed) -> EncapsulationKey {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Wire types and protocol implementation
-// ---------------------------------------------------------------------------
-
 #[derive(thiserror::Error, Debug)]
 pub enum Error {
     #[error("quic connection error")]
@@ -204,12 +195,12 @@ pub enum Error {
     #[error("io communication error")]
     Io(#[from] io::Error),
     #[error(
-        "invalid count of keys/ciphertexts received. expected: {expected}, actual0: {actual0}, actual1: {actual1}"
+        "invalid count of keys/ciphertexts received. expected: {expected}, actual_0: {actual_0}, actual_1: {actual_1}"
     )]
     InvalidDataCount {
         expected: usize,
-        actual0: usize,
-        actual1: usize,
+        actual_0: usize,
+        actual_1: usize,
     },
     #[error("expected message but stream is closed")]
     ClosedStream,
@@ -264,7 +255,6 @@ pub struct MlKemOt {
     conn: Connection,
 }
 
-/// Note: MlKemOt is not `Malicious` secure in itself.
 impl SemiHonest for MlKemOt {}
 
 impl MlKemOt {
@@ -303,8 +293,8 @@ impl RotSender for MlKemOt {
         if receiver_msg.rs_0.len() != count || receiver_msg.rs_1.len() != count {
             return Err(Error::InvalidDataCount {
                 expected: count,
-                actual0: receiver_msg.rs_0.len(),
-                actual1: receiver_msg.rs_1.len(),
+                actual_0: receiver_msg.rs_0.len(),
+                actual_1: receiver_msg.rs_1.len(),
             });
         }
 
@@ -320,7 +310,7 @@ impl RotSender for MlKemOt {
             let r_0 = EncapsulationKey::from_bytes(&r_0_bytes.0);
             let r_1 = EncapsulationKey::from_bytes(&r_1_bytes.0);
 
-            // Step 6: Reconstruct encapsulation keys: ek_j = r_j + H(r_{1-j}).
+            // Step 6: Reconstruct encapsulation keys: ek_j = r_j + hash_ek(r_{1-j}).
             let ek_0 = &r_0 + &hash_ek(&r_1);
             let ek_1 = &r_1 + &hash_ek(&r_0);
 
@@ -379,7 +369,7 @@ impl RotReceiver for MlKemOt {
             // Step 2: Sample random key for position 1-b.
             let r_1_b = random_ek(&mut self.rng, ek.rho);
 
-            // Step 3: Compute correlated key: r_b = ek - H(r_{1-b}).
+            // Step 3: Compute real key: r_b = ek - hash_ek(r_{1-b}).
             let r_b = &ek - &hash_ek(&r_1_b);
             let r_b_bytes: EncapsulationKeyBytes = (&r_b).into();
             let r_1_b_bytes: EncapsulationKeyBytes = (&r_1_b).into();
@@ -387,12 +377,12 @@ impl RotReceiver for MlKemOt {
             // Step 4: Select (r_0, r_1) based on choice bit (constant-time).
             // If b=0: r_0 = real, r_1 = random.
             // If b=1: r_0 = random, r_1 = real.
-            let ek_0 = EncapsulationKeyBytes::conditional_select(&r_b_bytes, &r_1_b_bytes, *choice);
-            let ek_1 = EncapsulationKeyBytes::conditional_select(&r_1_b_bytes, &r_b_bytes, *choice);
+            let r_0 = EncapsulationKeyBytes::conditional_select(&r_b_bytes, &r_1_b_bytes, *choice);
+            let r_1 = EncapsulationKeyBytes::conditional_select(&r_1_b_bytes, &r_b_bytes, *choice);
 
             decap_keys.push(dk);
-            rs_0.push(ek_0);
-            rs_1.push(ek_1);
+            rs_0.push(r_0);
+            rs_1.push(r_1);
         }
 
         let receiver_msg = EncapsulationKeysMessage { rs_0, rs_1 };
@@ -409,8 +399,8 @@ impl RotReceiver for MlKemOt {
         if sender_msg.cts_0.len() != count || sender_msg.cts_1.len() != count {
             return Err(Error::InvalidDataCount {
                 expected: count,
-                actual0: sender_msg.cts_0.len(),
-                actual1: sender_msg.cts_1.len(),
+                actual_0: sender_msg.cts_0.len(),
+                actual_1: sender_msg.cts_1.len(),
             });
         }
 
@@ -421,16 +411,14 @@ impl RotReceiver for MlKemOt {
             .zip(sender_msg.cts_0.iter().zip(sender_msg.cts_1.iter()))
             .enumerate()
         {
-            let ct_bytes = CiphertextBytes::conditional_select(ct_0, ct_1, *choice).0;
-            let chosen_ct: MlKemCiphertext<MlKem> = ct_bytes
+            let ct_b_bytes = CiphertextBytes::conditional_select(ct_0, ct_1, *choice).0;
+            let ct_b: MlKemCiphertext<MlKem> = ct_b_bytes
                 .as_slice()
                 .try_into()
                 .expect("incorrect ciphertext size");
-            let shared_secret = dk
-                .decapsulate(&chosen_ct)
-                .map_err(|_| Error::Decapsulation)?;
-            let shared_key = derive_ot_key(&shared_secret, i);
-            ots[i] = shared_key;
+            let shared_secret = dk.decapsulate(&ct_b).map_err(|_| Error::Decapsulation)?;
+            let key_b = derive_ot_key(&shared_secret, i);
+            ots[i] = key_b;
         }
 
         Ok(())
@@ -438,22 +426,24 @@ impl RotReceiver for MlKemOt {
 }
 
 // Encapsulates to the given key, returning the ciphertext and the shared key.
+// Note: ML-KEM encapsulation is infallible - the Result in the ml-kem crate is
+// for API generality.
 fn encapsulate(
     ek: &EncapsulationKeyBytes,
     rng: &mut StdRng,
 ) -> (CiphertextBytes, SharedKey<MlKem>) {
     let parsed_ek = MlKemEncapsulationKey::<MlKemParams>::from_bytes((&ek.0).into());
-    let (ct, k): (MlKemCiphertext<MlKem>, SharedKey<MlKem>) = parsed_ek
+    let (ct, ss): (MlKemCiphertext<MlKem>, SharedKey<MlKem>) = parsed_ek
         .encapsulate(&mut RngCompat(rng))
-        .expect("encapsulation should not fail");
+        .expect("encapsulation failed");
     (
         CiphertextBytes(ct.as_slice().try_into().expect("incorrect ciphertext size")),
-        k,
+        ss,
     )
 }
 
 // Derive an OT key from the ML-KEM shared key using a random oracle XOF,
-// extracting a Block-sized (128-bit) output.
+// returning a Block-sized (128-bit) output.
 fn derive_ot_key(key: &SharedKey<MlKem>, tweak: usize) -> Block {
     let mut ro = RandomOracle::new();
     ro.update(HASH_DOMAIN_SEPARATOR);
@@ -528,6 +518,22 @@ mod tests {
         for ((r, s), c) in r_ot.into_iter().zip(s_ot).zip(choices) {
             assert_eq!(r, s[c.unwrap_u8() as usize])
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mlkem_base_rot_single_ot() -> Result<()> {
+        let _g = init_tracing();
+        let (con1, con2) = local_conn().await?;
+        let rng1 = StdRng::seed_from_u64(42);
+        let rng2 = StdRng::seed_from_u64(43);
+        let choices = vec![subtle::Choice::from(1)];
+
+        let mut sender = MlKemOt::new_with_rng(con1, rng1);
+        let mut receiver = MlKemOt::new_with_rng(con2, rng2);
+        let (s_ot, r_ot) = tokio::try_join!(sender.send(1), receiver.receive(&choices))?;
+
+        assert_eq!(r_ot[0], s_ot[0][1]);
         Ok(())
     }
 }

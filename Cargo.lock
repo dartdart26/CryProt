@@ -493,6 +493,7 @@ dependencies = [
  "anyhow",
  "bitvec",
  "bytemuck",
+ "cfg-if",
  "criterion",
  "cryprot-codes",
  "cryprot-core",

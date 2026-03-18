@@ -18,17 +18,13 @@ ML-KEM implementation: [ML-KEM](https://github.com/RustCrypto/KEMs/blob/5a7f3ab7
 ### Vectors and Keys
 
 - `k`: determines the module dimension (k=2 for ML-KEM-512, k=3 for ML-KEM-768, k=4 for ML-KEM-1024)
-- `NttVector<k>`: a vector of `k` `NttPolynomial`s in `T_q^k`
+- `NttVector`: a vector of `k` `NttPolynomial`s, i.e `T_q^k`
 
-An ML-KEM encapsulation key (public key) consists of two parts:
-
-```
-ek = (t_hat, rho)
-```
-
-where:
-- `t_hat` is an `NttVector<k>`: the public key vector in NTT domain (`t_hat = A_hat * s + e` in NTT form)
+An ML-KEM encapsulation key is represented as `EncapsulationKey(t_hat, rho)` where:
+- `t_hat` is in `T_q^k`, i.e. an `NttVector` — the public key vector in NTT domain (`t_hat = A_hat * s + e` in NTT form)
 - `rho` is a 32-byte seed used to derive the public matrix `A_hat`
+
+We write `ek.t_hat` and `ek.rho` to refer to the two components.
 
 Note that the ML-KEM encapsulation key is the same as the K-PKE encryption key (FIPS 203, Section 5).
 
@@ -40,62 +36,58 @@ ek_bytes = ByteEncode_12(t_hat) || rho
 
 where `ByteEncode_12` encodes each of the `256*k` coefficients using 12 bits (FIPS 203, Algorithm 5 ByteEncode_d).
 
-We write `ek.t_hat` and `ek.rho` to refer to the two components of an encapsulation key.
-
 A decapsulation key `dk` contains the secret vector `s` and some additional data (FIPS 203, Algorithm 16 KeyGen_internal).
 
 ### Operations
 
-- `+` and `-` on `NttVector<k>`: component-wise addition and subtraction in `T_q^k`
-- `SampleNTT(B)`: Algorithm 7 from FIPS 203. Reads from a byte stream `B` and produces a pseudorandom element in `T_q`, i.e. an `NttPolynomial`
+- `+` and `-` on `NttVector`: component-wise addition and subtraction in `T_q^k`
+- `EncapsulationKey +/- NttVector -> EncapsulationKey`: operates on the `t_hat` component only, `rho` is preserved from the `EncapsulationKey`
 
 ### Helper Functions
 
-**`SampleNTTVector(seed, rho) -> (t_hat, rho)`**
+**`sample_ntt_poly(xof) -> NttPolynomial`**
 
-Our helper (not from FIPS 203 or MR19). Produces a pseudorandom `NttVector<k>` from a 32-byte
-`seed` by calling `SampleNTT` (FIPS 203, Algorithm 7) `k` times, once per polynomial. Each
-`SampleNTT` call produces a pseudorandom element of `T_q`. The resulting `NttVector<k>`
+Algorithm 7 from FIPS 203. Reads bytes from a XOF and produces a pseudorandom element in `T_q`.
+
+**`sample_ntt_vector(seed) -> NttVector`**
+
+Our helper (not from FIPS 203 or MR19). Produces a pseudorandom `NttVector` from a 32-byte
+`seed` by calling `sample_ntt_poly` (FIPS 203, Algorithm 7) `k` times, once per polynomial. Each
+`sample_ntt_poly` call produces a pseudorandom element of `T_q`. The resulting `NttVector`
 is indistinguishable from a real `t_hat`, since a real `t_hat = A_hat * s + e` is computationally
 indistinguishable from a pseudorandom vector in `T_q^k`.
 
 ```
 for j in 0..k:
-    t_hat[j] = SampleNTT(seed || j || 0)     // 34 bytes: 32-byte seed + 2 index bytes
+    x = xof(seed || 0 || j)             // 34 bytes: 32-byte seed + 2 index bytes
+    t_hat[j] = sample_ntt_poly(x)
 ```
 
-Each call uses different index bytes `(j, 0)` in FIPS 203 Algorithm 7 for domain separation.
+Each call uses different index bytes `(0, j)` for different XOF stream.
 In libOTe, this corresponds to `randomPK`, where it instead generates `A_hat` and takes the first row from it.
 
-Output: `(t_hat, rho)`. The `rho` is passed through unchanged.
+**`hash_ek(ek) -> NttVector`**
 
-**`HashEK(ek) -> (h, ek.rho)`**
+Corresponds to libOTe's `pkHash`. Hashes `ek.t_hat` to a 32-byte seed and then samples a new `NttVector` from it.
 
-HashEK corresponds to libOTe's `pkHash`. Maps an encapsulation key to another
-encapsulation key. Takes an element of `T_q^k`, hashes it to a 32-byte seed, and uses that seed to sample a new element of `T_q^k`.
-
-Given an encapsulation key `ek = (t_hat, rho)`:
+Given an `EncapsulationKey` `ek`:
 
 ```
-seed = SHA3-256(ByteEncode_12(ek.t_hat))     // hash only the t_hat bytes, not rho
-h    = SampleNTTVector(seed, ek.rho)         // sample a new NttVector<k> from the seed
+seed = sha3_256(ByteEncode_12(ek.t_hat))     // hash only the t_hat bytes, not rho
+h    = sample_ntt_vector(seed)               // sample a new NttVector from the seed
 ```
 
-Output: `(h, ek.rho)` where `h` is an `NttVector<k>` in `T_q^k`.
+Output: `h`.
 
-**`RandomEK(rng, rho) -> (t_hat, rho)`**
+**`random_ek(rng, rho) -> EncapsulationKey`**
 
-Generate a random encapsulation key. A 32-byte `seed` is sampled from `rng`:
+Generate a random encapsulation key. A 32-byte random `seed` is sampled from a cryptographically secure random number generator `rng`:
 
-Output: `SampleNTTVector(seed, rho)`
+Output: `EncapsulationKey(sample_ntt_vector(seed), rho)`
 
-This is identical to `HashEK` except the seed is random rather than derived from a hash.
+Sampling is identical to the one on `hash_ek`, except that the seed is random rather than derived from a hash.
 
 ## Protocol
-
-**Convention:** All arithmetic (`+`, `-`) in the protocol steps operates on the `t_hat`
-component only. The `rho` component is always the same across all keys in a single OT
-(taken from the real key generated in step 1) and is carried along unchanged.
 
 ### Receiver (choice bit `b`)
 
@@ -103,17 +95,17 @@ component only. The `rho` component is always the same across all keys in a sing
    ```
    (dk, ek) = ML-KEM.KeyGen()
    ```
-   where `ek = (t_hat, rho)`.
+   where `ek` is an `EncapsulationKey`.
 
 2. **Sample random key for position `1-b`:**
    ```
-   r_{1-b} = RandomEK(rng, ek.rho)
+   r_{1-b} = random_ek(rng, ek.rho)
    ```
    where `rng` is a cryptographically secure random number generator.
 
-3. **Compute the correlated key for position `b`:**
+3. **Compute the real key for position `b`:**
    ```
-   r_b = ek - HashEK(r_{1-b})
+   r_b = ek - hash_ek(r_{1-b})
    ```
 
 4. **Send to sender:**
@@ -128,7 +120,7 @@ component only. The `rho` component is always the same across all keys in a sing
 
 6. **For each `j in {0, 1}`, reconstruct the encapsulation key:**
    ```
-   ek_j = r_j + HashEK(r_{1-j})
+   ek_j = r_j + hash_ek(r_{1-j})
    ```
 
 7. **Encapsulate to both reconstructed keys:**
@@ -172,33 +164,32 @@ component only. The `rho` component is always the same across all keys in a sing
 
 **Correctness:**
 
-For the chosen side `b`, the sender reconstructs in step 6:
+For the chosen side `b`, the sender reconstructs in step 6 by expanding `r_b`:
 ```
-ek_b = r_b + HashEK(r_{1-b})
-     = (ek - HashEK(r_{1-b})) + HashEK(r_{1-b})
+ek_b = r_b + hash_ek(r_{1-b})
+     = (ek - hash_ek(r_{1-b})) + hash_ek(r_{1-b})
      = ek
 ```
-So `ek_b = ek`, the real public key. In step 10, the receiver calls `ML-KEM.Decaps(dk, ct_b)` and
+So `ek_b = ek`, the real encapsulation key. In step 10, the receiver calls `ML-KEM.Decaps(dk, ct_b)` and
 recovers the same shared secret `ss_b` that the sender computed via `ML-KEM.Encaps(ek_b)` in step 7.
 
 **Security:**
 
 For the other side `1-b`, the sender reconstructs in step 6:
 ```
-ek_{1-b} = r_{1-b} + HashEK(r_b)
+ek_{1-b} = r_{1-b} + hash_ek(r_b)
 ```
 
 Expanding `r_b` (from step 3):
 ```
-ek_{1-b} = r_{1-b} + HashEK(ek - HashEK(r_{1-b}))
+ek_{1-b} = r_{1-b} + hash_ek(ek - hash_ek(r_{1-b}))
 ```
 
-This does NOT simplify — `HashEK` is a hash function, so `HashEK(ek - HashEK(r_{1-b}))` does not
-cancel with `HashEK(r_{1-b})`. The result `ek_{1-b}` is an unrelated key for which the
-receiver does not have a decapsulation key `dk`, so they cannot decapsulate `ct_{1-b}`.
+This does not simplify — `hash_ek` is a hash function, so the nested `hash_ek(ek - hash_ek(r_{1-b}))`
+cannot be reduced. The result `ek_{1-b}` is an unrelated key for which the receiver does not
+have a decapsulation key `dk`, so they cannot decapsulate `ct_{1-b}`.
 
-The choice bit `b` is hidden because `r_b = ek - HashEK(r_{1-b})`. Since `ek` is
-indistinguishable from uniform under the MLWE assumption, and `HashEK(r_{1-b})` is determined by the
-already-public `r_{1-b}`, subtracting it from a uniform value still yields a uniform
-value. So both `r_0` and `r_1` appear uniform to the sender — neither reveals which
-is the real key.
+The choice bit `b` is hidden from the sender. The sender reconstructs both `ek_0` and `ek_1` in
+step 6, but under the MLWE assumption, a real encapsulation key is indistinguishable from a random
+one. Since both reconstructed keys appear as valid encapsulation keys, the sender cannot determine
+which one has a corresponding decapsulation key `dk`.
