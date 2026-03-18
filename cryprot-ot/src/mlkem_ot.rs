@@ -111,8 +111,8 @@ impl std::ops::Add<&NttVector> for &EncapsulationKey {
     }
 }
 
-/// XOF(rho, j, i) from FIPS 203, Algorithm 2 SHAKE128example.
-/// In Algorithm 13 (K-PKE.KeyGen), this is called as XOF(rho, j, i) where
+/// XOF(seed, j, i) from FIPS 203, Algorithm 2 SHAKE128example.
+/// In Algorithm 13 (K-PKE.KeyGen), this is called as XOF(seed, j, i) where
 /// j is the column index (byte 32) and i is the row index (byte 33),
 /// using 0-based indexing.
 fn xof(seed: &Seed, j: u8, i: u8) -> impl XofReader {
@@ -176,15 +176,15 @@ fn sample_ntt_vector(seed: &Seed) -> NttVector {
 }
 
 /// Maps an encapsulation key to an NttVector via SHA3-256.
-/// Only the t_hat component is hashed; rho is ignored.
+/// Only the t_hat component is used; rho is ignored.
 /// Corresponds to libOTe's `pkHash`.
-fn hash_to_key(ek: &EncapsulationKey) -> NttVector {
+fn hash_ek(ek: &EncapsulationKey) -> NttVector {
     let encoded = <NttVector as Encode<U12>>::encode(&ek.t_hat);
     let seed: Seed = sha3::Sha3_256::digest(encoded.as_slice()).into();
     sample_ntt_vector(&seed)
 }
 
-/// RandomEK: generate a random encapsulation key from a random seed.
+/// Generate a random encapsulation key using the given randomness and rho.
 fn random_ek(rng: &mut StdRng, rho: Seed) -> EncapsulationKey {
     let seed: Seed = rng.random();
     EncapsulationKey {
@@ -235,9 +235,9 @@ impl ConditionallySelectable for EncapsulationKeyBytes {
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize)]
-struct CtBytes(#[serde(with = "serde_bytes")] [u8; CIPHERTEXT_LEN]);
+struct CiphertextBytes(#[serde(with = "serde_bytes")] [u8; CIPHERTEXT_LEN]);
 
-impl ConditionallySelectable for CtBytes {
+impl ConditionallySelectable for CiphertextBytes {
     fn conditional_select(a: &Self, b: &Self, choice: Choice) -> Self {
         Self(<[u8; CIPHERTEXT_LEN]>::conditional_select(
             &a.0, &b.0, choice,
@@ -248,15 +248,15 @@ impl ConditionallySelectable for CtBytes {
 // Message from receiver to sender: two values (r_0, r_1) per OT.
 #[derive(Serialize, Deserialize)]
 struct EncapsulationKeysMessage {
-    eks0: Vec<EncapsulationKeyBytes>,
-    eks1: Vec<EncapsulationKeyBytes>,
+    rs_0: Vec<EncapsulationKeyBytes>,
+    rs_1: Vec<EncapsulationKeyBytes>,
 }
 
 // Message from sender to receiver: two ciphertexts per OT.
 #[derive(Serialize, Deserialize)]
 struct CiphertextsMessage {
-    cts0: Vec<CtBytes>,
-    cts1: Vec<CtBytes>,
+    cts_0: Vec<CiphertextBytes>,
+    cts_1: Vec<CiphertextBytes>,
 }
 
 pub struct MlKemOt {
@@ -300,44 +300,44 @@ impl RotSender for MlKemOt {
             recv_stream.next().await.ok_or(Error::ClosedStream)??
         };
 
-        if receiver_msg.eks0.len() != count || receiver_msg.eks1.len() != count {
+        if receiver_msg.rs_0.len() != count || receiver_msg.rs_1.len() != count {
             return Err(Error::InvalidDataCount {
                 expected: count,
-                actual0: receiver_msg.eks0.len(),
-                actual1: receiver_msg.eks1.len(),
+                actual0: receiver_msg.rs_0.len(),
+                actual1: receiver_msg.rs_1.len(),
             });
         }
 
-        let mut cts0 = Vec::with_capacity(count);
-        let mut cts1 = Vec::with_capacity(count);
-        for (i, (r0_bytes, r1_bytes)) in receiver_msg
-            .eks0
+        let mut cts_0 = Vec::with_capacity(count);
+        let mut cts_1 = Vec::with_capacity(count);
+        for (i, (r_0_bytes, r_1_bytes)) in receiver_msg
+            .rs_0
             .iter()
-            .zip(receiver_msg.eks1.iter())
+            .zip(receiver_msg.rs_1.iter())
             .enumerate()
         {
             // Step 5: Receive (r_0, r_1) from the receiver (done above).
-            let r0 = EncapsulationKey::from_bytes(&r0_bytes.0);
-            let r1 = EncapsulationKey::from_bytes(&r1_bytes.0);
+            let r_0 = EncapsulationKey::from_bytes(&r_0_bytes.0);
+            let r_1 = EncapsulationKey::from_bytes(&r_1_bytes.0);
 
             // Step 6: Reconstruct encapsulation keys: ek_j = r_j + H(r_{1-j}).
-            let ek0 = &r0 + &hash_to_key(&r1);
-            let ek1 = &r1 + &hash_to_key(&r0);
+            let ek_0 = &r_0 + &hash_ek(&r_1);
+            let ek_1 = &r_1 + &hash_ek(&r_0);
 
             // Step 7: Encapsulate to both reconstructed keys.
-            let (ct0, ss0) = encapsulate(&(&ek0).into(), &mut self.rng);
-            let (ct1, ss1) = encapsulate(&(&ek1).into(), &mut self.rng);
+            let (ct_0, ss_0) = encapsulate(&(&ek_0).into(), &mut self.rng);
+            let (ct_1, ss_1) = encapsulate(&(&ek_1).into(), &mut self.rng);
 
             // Step 8: Derive OT output keys.
-            let key0 = hash(&ss0, i);
-            let key1 = hash(&ss1, i);
+            let key_0 = derive_ot_key(&ss_0, i);
+            let key_1 = derive_ot_key(&ss_1, i);
 
-            cts0.push(ct0);
-            cts1.push(ct1);
-            ots[i] = [key0, key1];
+            cts_0.push(ct_0);
+            cts_1.push(ct_1);
+            ots[i] = [key_0, key_1];
         }
 
-        let sender_msg = CiphertextsMessage { cts0, cts1 };
+        let sender_msg = CiphertextsMessage { cts_0, cts_1 };
         {
             let mut send_stream = send.as_stream();
             send_stream.send(sender_msg).await?;
@@ -363,8 +363,8 @@ impl RotReceiver for MlKemOt {
         let (mut send, mut recv) = self.conn.byte_stream().await?;
 
         let mut decap_keys: Vec<DecapsulationKey<MlKemParams>> = Vec::with_capacity(count);
-        let mut eks0 = Vec::with_capacity(count);
-        let mut eks1 = Vec::with_capacity(count);
+        let mut rs_0 = Vec::with_capacity(count);
+        let mut rs_1 = Vec::with_capacity(count);
 
         for choice in choices.iter() {
             // Step 1: Generate real keypair.
@@ -380,22 +380,22 @@ impl RotReceiver for MlKemOt {
             let r_1_b = random_ek(&mut self.rng, ek.rho);
 
             // Step 3: Compute correlated key: r_b = ek - H(r_{1-b}).
-            let r_b = &ek - &hash_to_key(&r_1_b);
+            let r_b = &ek - &hash_ek(&r_1_b);
             let r_b_bytes: EncapsulationKeyBytes = (&r_b).into();
             let r_1_b_bytes: EncapsulationKeyBytes = (&r_1_b).into();
 
             // Step 4: Select (r_0, r_1) based on choice bit (constant-time).
             // If b=0: r_0 = real, r_1 = random.
             // If b=1: r_0 = random, r_1 = real.
-            let ek0 = EncapsulationKeyBytes::conditional_select(&r_b_bytes, &r_1_b_bytes, *choice);
-            let ek1 = EncapsulationKeyBytes::conditional_select(&r_1_b_bytes, &r_b_bytes, *choice);
+            let ek_0 = EncapsulationKeyBytes::conditional_select(&r_b_bytes, &r_1_b_bytes, *choice);
+            let ek_1 = EncapsulationKeyBytes::conditional_select(&r_1_b_bytes, &r_b_bytes, *choice);
 
             decap_keys.push(dk);
-            eks0.push(ek0);
-            eks1.push(ek1);
+            rs_0.push(ek_0);
+            rs_1.push(ek_1);
         }
 
-        let receiver_msg = EncapsulationKeysMessage { eks0, eks1 };
+        let receiver_msg = EncapsulationKeysMessage { rs_0, rs_1 };
         {
             let mut send_stream = send.as_stream();
             send_stream.send(receiver_msg).await?;
@@ -406,30 +406,30 @@ impl RotReceiver for MlKemOt {
             recv_stream.next().await.ok_or(Error::ClosedStream)??
         };
 
-        if sender_msg.cts0.len() != count || sender_msg.cts1.len() != count {
+        if sender_msg.cts_0.len() != count || sender_msg.cts_1.len() != count {
             return Err(Error::InvalidDataCount {
                 expected: count,
-                actual0: sender_msg.cts0.len(),
-                actual1: sender_msg.cts1.len(),
+                actual0: sender_msg.cts_0.len(),
+                actual1: sender_msg.cts_1.len(),
             });
         }
 
         // Step 10-11: Decapsulate the chosen ciphertext and derive OT key.
-        for (i, ((dk, choice), (ct0, ct1))) in decap_keys
+        for (i, ((dk, choice), (ct_0, ct_1))) in decap_keys
             .iter()
             .zip(choices.iter())
-            .zip(sender_msg.cts0.iter().zip(sender_msg.cts1.iter()))
+            .zip(sender_msg.cts_0.iter().zip(sender_msg.cts_1.iter()))
             .enumerate()
         {
-            let ct_bytes = CtBytes::conditional_select(ct0, ct1, *choice).0;
+            let ct_bytes = CiphertextBytes::conditional_select(ct_0, ct_1, *choice).0;
             let chosen_ct: MlKemCiphertext<MlKem> = ct_bytes
                 .as_slice()
                 .try_into()
                 .expect("incorrect ciphertext size");
-            let shared_key = dk
+            let shared_secret = dk
                 .decapsulate(&chosen_ct)
                 .map_err(|_| Error::Decapsulation)?;
-            let shared_key = hash(&shared_key, i);
+            let shared_key = derive_ot_key(&shared_secret, i);
             ots[i] = shared_key;
         }
 
@@ -438,20 +438,23 @@ impl RotReceiver for MlKemOt {
 }
 
 // Encapsulates to the given key, returning the ciphertext and the shared key.
-fn encapsulate(ek: &EncapsulationKeyBytes, rng: &mut StdRng) -> (CtBytes, SharedKey<MlKem>) {
+fn encapsulate(
+    ek: &EncapsulationKeyBytes,
+    rng: &mut StdRng,
+) -> (CiphertextBytes, SharedKey<MlKem>) {
     let parsed_ek = MlKemEncapsulationKey::<MlKemParams>::from_bytes((&ek.0).into());
     let (ct, k): (MlKemCiphertext<MlKem>, SharedKey<MlKem>) = parsed_ek
         .encapsulate(&mut RngCompat(rng))
         .expect("encapsulation should not fail");
     (
-        CtBytes(ct.as_slice().try_into().expect("incorrect ciphertext size")),
+        CiphertextBytes(ct.as_slice().try_into().expect("incorrect ciphertext size")),
         k,
     )
 }
 
 // Derive an OT key from the ML-KEM shared key using a random oracle XOF,
 // extracting a Block-sized (128-bit) output.
-fn hash(key: &SharedKey<MlKem>, tweak: usize) -> Block {
+fn derive_ot_key(key: &SharedKey<MlKem>, tweak: usize) -> Block {
     let mut ro = RandomOracle::new();
     ro.update(HASH_DOMAIN_SEPARATOR);
     ro.update(key.as_slice());

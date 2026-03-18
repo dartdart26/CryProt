@@ -69,9 +69,9 @@ In libOTe, this corresponds to `randomPK`, where it instead generates `A_hat` an
 
 Output: `(t_hat, rho)`. The `rho` is passed through unchanged.
 
-**`HashToKey(ek) -> (h, ek.rho)`**
+**`HashEK(ek) -> (h, ek.rho)`**
 
-HashToKey corresponds to libOTe's `pkHash`. Maps an encapsulation key to another
+HashEK corresponds to libOTe's `pkHash`. Maps an encapsulation key to another
 encapsulation key. Takes an element of `T_q^k`, hashes it to a 32-byte seed, and uses that seed to sample a new element of `T_q^k`.
 
 Given an encapsulation key `ek = (t_hat, rho)`:
@@ -83,13 +83,13 @@ h    = SampleNTTVector(seed, ek.rho)         // sample a new NttVector<k> from t
 
 Output: `(h, ek.rho)` where `h` is an `NttVector<k>` in `T_q^k`.
 
-**`RandomEK(seed, rho) -> (t_hat, rho)`**
+**`RandomEK(rng, rho) -> (t_hat, rho)`**
 
-Generate a random encapsulation key from the given random 32 byte `seed` and `rho`:
+Generate a random encapsulation key. A 32-byte `seed` is sampled from `rng`:
 
 Output: `SampleNTTVector(seed, rho)`
 
-This is identical to `H` except the seed is random rather than derived from a hash.
+This is identical to `HashEK` except the seed is random rather than derived from a hash.
 
 ## Protocol
 
@@ -107,13 +107,13 @@ component only. The `rho` component is always the same across all keys in a sing
 
 2. **Sample random key for position `1-b`:**
    ```
-   seed = 32 random bytes
-   r_{1-b} = RandomEK(seed, ek.rho)
+   r_{1-b} = RandomEK(rng, ek.rho)
    ```
+   where `rng` is a cryptographically secure random number generator.
 
 3. **Compute the correlated key for position `b`:**
    ```
-   r_b = ek - H(r_{1-b})
+   r_b = ek - HashEK(r_{1-b})
    ```
 
 4. **Send to sender:**
@@ -128,7 +128,7 @@ component only. The `rho` component is always the same across all keys in a sing
 
 6. **For each `j in {0, 1}`, reconstruct the encapsulation key:**
    ```
-   ek_j = r_j + H(r_{1-j})
+   ek_j = r_j + HashEK(r_{1-j})
    ```
 
 7. **Encapsulate to both reconstructed keys:**
@@ -174,8 +174,8 @@ component only. The `rho` component is always the same across all keys in a sing
 
 For the chosen side `b`, the sender reconstructs in step 6:
 ```
-ek_b = r_b + H(r_{1-b})
-     = (ek - H(r_{1-b})) + H(r_{1-b})
+ek_b = r_b + HashEK(r_{1-b})
+     = (ek - HashEK(r_{1-b})) + HashEK(r_{1-b})
      = ek
 ```
 So `ek_b = ek`, the real public key. In step 10, the receiver calls `ML-KEM.Decaps(dk, ct_b)` and
@@ -185,20 +185,20 @@ recovers the same shared secret `ss_b` that the sender computed via `ML-KEM.Enca
 
 For the other side `1-b`, the sender reconstructs in step 6:
 ```
-ek_{1-b} = r_{1-b} + H(r_b)
+ek_{1-b} = r_{1-b} + HashEK(r_b)
 ```
 
 Expanding `r_b` (from step 3):
 ```
-ek_{1-b} = r_{1-b} + H(ek - H(r_{1-b}))
+ek_{1-b} = r_{1-b} + HashEK(ek - HashEK(r_{1-b}))
 ```
 
-This does NOT simplify — `H` is a hash function, so `H(ek - H(r_{1-b}))` does not
-cancel with `H(r_{1-b})`. The result `ek_{1-b}` is an unrelated key for which the
+This does NOT simplify — `HashEK` is a hash function, so `HashEK(ek - HashEK(r_{1-b}))` does not
+cancel with `HashEK(r_{1-b})`. The result `ek_{1-b}` is an unrelated key for which the
 receiver does not have a decapsulation key `dk`, so they cannot decapsulate `ct_{1-b}`.
 
-The choice bit `b` is hidden because `r_b = ek - H(r_{1-b})`. Since `ek` is
-indistinguishable from uniform under the MLWE assumption, and `H(r_{1-b})` is determined by the
+The choice bit `b` is hidden because `r_b = ek - HashEK(r_{1-b})`. Since `ek` is
+indistinguishable from uniform under the MLWE assumption, and `HashEK(r_{1-b})` is determined by the
 already-public `r_{1-b}`, subtracting it from a uniform value still yields a uniform
 value. So both `r_0` and `r_1` appear uniform to the sender — neither reveals which
 is the real key.
